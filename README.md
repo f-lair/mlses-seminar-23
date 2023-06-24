@@ -1,5 +1,9 @@
 # MLSES Seminar 23: Solar Thermal System
 
+![Python](https://img.shields.io/badge/python-3.10-blue.svg)
+[![CI](https://github.com/f-lair/mlses-seminar-23/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/f-lair/mlses-seminar-23/actions/workflows/ci.yml)
+![License](https://img.shields.io/github/license/f-lair/mlses-seminar-23)
+
 This seminar work is about time series forecasting and function approximation for solar thermal system data.
 
 The solar thermal system contains four different circuits: Boiler, heating, solar, and water. 
@@ -7,7 +11,7 @@ Each circuit incorporates three temperature sensors (T1-T3) as well as a sensor 
 Moreover, the quantity heat transfer (Qth) is of interest, which is in a functional relation to the temperatures and the volume flow rate, i.e., can be calculated from the former.
 
 The first task, *time series forecasting*, is to predict VF and Qth for one timestep (5s) and one hour into the future, respectively, given all sensor data of the past.
-The second task, *function approximation*, is to predict VF and Qth, given only temperature sensor data of the past and the future.
+The second task, *function approximation*, is to predict VF and Qth, given only temperature sensor data of the past, the present, and the future.
 
 ---
 
@@ -80,6 +84,7 @@ python main.py --task approximation
 
 After the fitting process is finished, a corresponding `.json` file is created in the directory `./models/`, which contains the model parameters.
 It is automatically found and loaded, when invoking the script in testing mode afterwards.
+Fitted models are included in this repository.
 
 ---
 
@@ -102,17 +107,17 @@ As the XGBoost model only accepts one-dimensional inputs and outputs, we also ha
 
 For the two forecast tasks, the window is unidirectional and ends at the time index prior to the (first) time index of interest $t$.
 In contrast to the 'approximation' task, the window here contains both source and target variables.
-This conjunction of $\mathcal{X}$ and $\mathcal{Y}$ along the feature dimension is denoted by $(\mathcal{X} +\!\!\!+~ \mathcal{Y}): \mathbb{T} \times \mathbb{R}^{d_1+d_2}$.
+This conjunction of $\mathcal{X}$ and $\mathcal{Y}$ along the feature dimension is denoted by $(\mathcal{X} ⧺ \mathcal{Y}): \mathbb{T} \times \mathbb{R}^{d_1+d_2}$.
 
 Analogously, a second window (called 'horizon' to distinguish) starts at $t$.
 In the 'forecast_hour' task, its size is 720 (1h / 5s = 3600s / 5s = 720), in the 'forecast_step' task, it is 1.
 
-To predict $(\mathcal{X} +\!\!\!+~ \mathcal{Y})(t, :)$ in the 'forecast_step' task, the model takes the window $(\mathcal{X} +\!\!\!+~ \mathcal{Y})(t-\tau : t, :)$ as input.
+To predict $(\mathcal{X} ⧺ \mathcal{Y})(t, :)$ in the 'forecast_step' task, the model takes the window $(\mathcal{X} ⧺ \mathcal{Y})(t-\tau : t, :)$ as input.
 
-Last, for the 'forecast_hour' task, we could theoretically extend this to the prediction of $(\mathcal{X} +\!\!\!+~ \mathcal{Y})(t : t + 720, :)$.
+Last, for the 'forecast_hour' task, we could theoretically extend this to the prediction of $(\mathcal{X} ⧺ \mathcal{Y})(t : t + 720, :)$.
 However, this is computationally quite demanding, and needs lots of memory.
 Therefore, we split the total prediction horizon into smaller partitions, which are then iteratively predicted using the previously predicted horizon partition.
-Formally, our model predicts $(\mathcal{X} +\!\!\!+~ \mathcal{Y})(t+i\lambda : t + (i+1)\lambda, :)$ using $(\mathcal{X} +\!\!\!+~ \mathcal{Y})(t + i\lambda - \tau : t + i\lambda, :)$ as input window, where $i\in\{0, 1, ..., \frac{720}{\lambda}\}$ and $\lambda\in\mathbb{N}$ refer to the current iteration and the size of the horizon partitions, respectively.
+Formally, our model predicts $(\mathcal{X} ⧺ \mathcal{Y})(t+i\lambda : t + (i+1)\lambda, :)$ using $(\mathcal{X} ⧺ \mathcal{Y})(t + i\lambda - \tau : t + i\lambda, :)$ as input window, where $i\in\{0, 1, ..., \frac{720}{\lambda}\}$ and $\lambda\in\mathbb{N}$ refer to the current iteration and the size of the horizon partitions, respectively.
 Note that $\lambda$ needs to be a factor of 720 and that $\lambda \geq \tau$ has to hold in order to make this work. 
 
 ### Data Preprocessing
