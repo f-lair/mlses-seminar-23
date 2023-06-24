@@ -1,15 +1,25 @@
+import math
 from typing import Dict, Tuple
 
 import numpy as np
 import xgboost as xgb
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-
 from tasks.base_task import BaseTask
-from utils import CIRCUITS, TimerContext, get_model_filepath, write_logs
+from tqdm import trange
+from utils import CIRCUITS, VF_to_Qth, compute_metrics, create_metrics
 
 
 class ApproximationTask(BaseTask):
     """Class for the function approximation task."""
+
+    def get_target_size(self) -> int:
+        """
+        Returns number of target features.
+
+        Returns:
+            int: Number of target features.
+        """
+
+        return len(CIRCUITS)  # VF per circuit
 
     @staticmethod
     def get_task_name() -> str:
@@ -22,187 +32,161 @@ class ApproximationTask(BaseTask):
 
         return 'approximation'
 
-    def preprocess(
-        self, source_data: Dict[str, np.ndarray], target_data: Dict[str, np.ndarray]
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    def create_windows(
+        self, X: np.ndarray, y: np.ndarray, indices: np.ndarray, window_size: int
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool]:
         """
-        Preprocesses source and target data dictionaries, yielding two ndarrays suited for supervised model fitting.
-        Returned arrays are structured as follows:
-        - Shapes are [B, D1] for source_data and [B, D2] for target_data
-            - B: Batch dimension (incorporating old batch and time dimensions)
-            - D1: Source feature dimension (12)
-                - 0, 3, 6, 9: T1 of solar, boiler, water, heating (respectively)
-                - 1, 4, 7, 10: T2 of solar, boiler, water, heating (respectively)
-                - 2, 5, 8, 11: T3 of solar, boiler, water, heating (respectively)
+        Creates windows for sliding window approach.
+        For the approximation task, the window is bidirectional.
+        It is centered at the target data point to be predicted.
+        N: Batch dimension.
+        B: Batch size (=number of windows).
+        D1: Source feature dimension.
+        D2: Target feature dimension.
+        W1: Flattened source window dimension.
+        W2: Flattened target window dimension.
 
         Args:
-            source_data (Dict[str, np.ndarray]): Source data (circuit -> ndarray).
-            target_data (Dict[str, np.ndarray]): Target data (circuit -> ndarray).
+            X (np.ndarray): Source data [N, D1].
+            y (np.ndarray): Target data [N, D2].
+            indices (np.ndarray): Indices of targets to be used [B].
+            window_size (int): Size of sliding window.
 
         Returns:
-            Tuple[np.ndarray, np.ndarray]: Source data, target data (preprocessed).
+            Tuple[[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool]: Windows for
+                source and target data ([B, W1], [B, W2]); T1, T2, T3 features for ground-truth
+                Qth computation [B, 4]; success flag (windows non-empty).
         """
 
-        source_data_list = []
-        target_data_list = []
+        # only odd window sizes permitted, as window is centered in data points
+        if window_size % 2 == 0:
+            raise ValueError("Window size must be odd for the approximation task!")
 
-        for circuit in CIRCUITS.values():
-            # make target shape equal to source shape by repeating data points
-            target_data[circuit] = np.repeat(target_data[circuit], repeats=50, axis=1)
-            assert source_data[circuit].shape == target_data[circuit].shape
+        N = len(X)  # number of data points
+        B = len(indices)  # batch size = number of windows
+        r = window_size // 2  # half window width
 
-            # flatten over first two dimensions
-            source_data[circuit] = np.reshape(source_data[circuit], (-1, 4))
-            target_data[circuit] = np.reshape(target_data[circuit], (-1, 4))
+        ## compute windows
+        # for X, windows are centered in data points corresponding to the targets to be predicted
+        # i.e., for y, windows are simply index-selected targets
+        # too small windows are discarded
+        valid_mask = np.logical_and(indices >= r, indices < N - r)
 
-            # add T1, T2, T3 to source data list
-            source_data_list.append(source_data[circuit][:, 1])  # T1
-            source_data_list.append(source_data[circuit][:, 2])  # T2
-            source_data_list.append(target_data[circuit][:, 2])  # T3
+        if not np.any(valid_mask):
+            empty = np.array([])
+            return empty, empty, empty, empty, empty, False
 
-            # add VF to target data list
-            target_data_list.append(target_data[circuit][:, 1])  # VF
+        X_windows = np.stack(
+            [
+                np.reshape(X[slice(indices[idx] - r, indices[idx] + r + 1)], (-1,))
+                for idx in range(B)
+                if valid_mask[idx]
+            ],
+            axis=0,
+        )  # B*[2r+1, D1] -> [B, (2r+1)*D1]
 
-        # stack along feature dimension
-        return np.stack(source_data_list, axis=-1), np.stack(target_data_list, axis=-1)
+        y_windows = y[indices[valid_mask]]
 
-    def fit(
+        X_valid = X[indices[valid_mask]]
+        T_indices = np.array([0, 3, 6, 9])  # cf. preprocess()
+        T1 = X_valid[:, T_indices]
+        T2 = X_valid[:, T_indices + 1]
+        T3 = X_valid[:, T_indices + 2]
+
+        return X_windows, y_windows, T1, T2, T3, True
+
+    def test_predict(
         self,
-        val_ratio: float,
-        num_rounds: int,
-        num_early_stopping_rounds: int,
+        model: xgb.Booster,
+        X_test: np.ndarray,
+        y_test: np.ndarray,
+        batch_size: int,
+        window_size: int,
         model_dir: str,
-        rng_seed: int,
-        **kwargs,
-    ) -> None:
+        model_name: str,
+        save_first_n_predictions: int,
+    ) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, float], Dict[str, float]]:
         """
-        Performs model fitting process:
-        Fits an XGBoost regression model in a supervised fashion.
+        Computes predictions and metric results for test data.
+        N: Batch dimension.
+        D1: Source feature dimension.
+        D2: Target feature dimension.
 
         Args:
-            val_ratio (float): Fractional size of the validation dataset, compared to the size of the original training dataset.
-            num_rounds (int): Max number of rounds (=trees) in the XGB model.
-            num_early_stopping_rounds (int): Number of rounds without improvement after which fitting is stopped.
+            model (xgb.Booster): XGBoost model.
+            X_test (np.ndarray): Test source data [N, D1].
+            y_test (np.ndarray): Test target data [N, D2].
+            batch_size (int): Data loading batch size.
+            window_size (int): Size of sliding window.
             model_dir (str): Path to model files.
-            rng_seed (int): Random number generator seed.
+            model_name (str): Name of the model.
+            save_first_n_predictions (int): Saves first n predictions of test data on disk.
+
+        Returns:
+            Tuple[Dict[str, float], Dict[str, float], Dict[str, float], Dict[str, float]]: RMSE
+                (VF), MAE (VF), RMSE (Qth), MAE (Qth) (keys circuit_names, 'total' per dict).
         """
 
-        X_train = self.X
-        y_train = self.y
+        max_iter = int(math.ceil(len(X_test) / batch_size))
 
-        # split into training, validation datasets
-        with TimerContext() as tc:
-            (X_train, y_train), (X_val, y_val) = self.create_data_split(
-                X_train, y_train, val_ratio, rng_seed
+        # set up metrics
+        rmse_vf_metrics, mae_vf_metrics, rmse_qth_metrics, mae_qth_metrics = create_metrics()
+
+        # iterate over batches
+        for idx in trange(max_iter, disable=not self.verbose):
+            # compute predictions for batch
+            indices = np.arange(
+                idx * batch_size, min((idx + 1) * batch_size, len(X_test)), dtype=int
             )
-        if self.verbose:
-            self.print("Data split.", tc.elapsed_time())
-
-        # free RAM
-        del self.X
-        del self.y
-
-        # fit model
-        if self.verbose:
-            print("[Iter]  Train Loss (RMSE)              Validation Loss (RMSE)")
-        model = xgb.XGBRegressor(
-            n_estimators=num_rounds,
-            early_stopping_rounds=num_early_stopping_rounds,
-            random_state=rng_seed,
-        )
-        with TimerContext() as tc:
-            model.fit(
-                X_train,
-                y_train,
-                eval_set=[(X_train, y_train), (X_val, y_val)],
-                verbose=self.verbose,
+            X_windows, y_windows, T1, T2, T3, success = self.create_windows(
+                X_test, y_test, indices, window_size
             )
-        if self.verbose:
-            self.print("Model fitted.", tc.elapsed_time())
 
-        # save fitted model
-        save_path = get_model_filepath(model_dir, self.get_task_name())
-        with TimerContext() as tc:
-            model.save_model(save_path)
-        if self.verbose:
-            self.print("Model saved.", tc.elapsed_time())
+            if not success:
+                continue
 
-        # Save logs
-        logs = model.evals_result()
-        with TimerContext() as tc:
-            write_logs(logs, model_dir, self.get_task_name())
-        if self.verbose:
-            self.print("Logs written.", tc.elapsed_time())
+            # predict only VF
+            y_pred = model.inplace_predict(X_windows, iteration_range=(0, model.best_iteration))
+            vf_target = y_windows
+            vf_pred = y_pred
 
-    def test(
-        self,
-        model_dir: str,
-        **kwargs,
-    ) -> None:
-        """
-        Performs model testing process:
-        Loads fitted XGB regression model and predicts outputs for unseen test data.
+            # COMPUTE QTH USING PREDICTIONS
+            qth_target = VF_to_Qth(vf_target, T1, T2, T3)
+            qth_pred = VF_to_Qth(vf_pred, T1, T2, T3)
 
-        Args:
-            model_dir (str): Path to model files.
-        """
+            # save predictions and targets on disk
+            if save_first_n_predictions > 0:
+                self.save_predictions(
+                    vf_target[:save_first_n_predictions],
+                    vf_pred[:save_first_n_predictions],
+                    qth_target[:save_first_n_predictions],
+                    qth_pred[:save_first_n_predictions],
+                    model_dir,
+                    model_name,
+                )
 
-        X_test = self.X
-        y_test = self.y
-
-        # load model
-        load_path = get_model_filepath(model_dir, self.get_task_name())
-        model = xgb.XGBRegressor()
-        with TimerContext() as tc:
-            model.load_model(load_path)
-        if self.verbose:
-            self.print("Model loaded.", tc.elapsed_time())
-
-        # predict on test data
-        with TimerContext() as tc:
-            y_pred = model.predict(X_test)
-        if self.verbose:
-            self.print("Predictions computed.", tc.elapsed_time())
+            # update metrics for batch
+            for circuit_id, circuit_name in CIRCUITS.items():
+                rmse_vf_metrics[circuit_name].update(
+                    y_pred[:, circuit_id], y_windows[:, circuit_id]
+                )
+                mae_vf_metrics[circuit_name].update(
+                    y_pred[:, circuit_id], y_windows[:, circuit_id]
+                )
+                rmse_qth_metrics[circuit_name].update(
+                    qth_pred[:, circuit_id], qth_target[:, circuit_id]
+                )
+                mae_qth_metrics[circuit_name].update(
+                    qth_pred[:, circuit_id], qth_target[:, circuit_id]
+                )
+            rmse_vf_metrics['total'].update(y_pred, y_windows)
+            mae_vf_metrics['total'].update(y_pred, y_windows)
+            rmse_qth_metrics['total'].update(qth_pred, qth_target)
+            mae_qth_metrics['total'].update(qth_pred, qth_target)
 
         # compute metrics
-        rmse = mean_squared_error(y_test, y_pred, squared=False)
-        mae = mean_absolute_error(y_test, y_pred)
-
-        # print results
-        self.print(f"RMSE = {rmse:.5f}")
-        self.print(f"MAE = {mae:.5f}")
-
-    def create_data_split(
-        self, X: np.ndarray, y: np.ndarray, val_ratio: float, rng_seed: int
-    ) -> Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]:
-        """
-        Creates training and validation splits.
-
-        Args:
-            X (np.ndarray): Source data (preprocessed).
-            y (np.ndarray): Target data (preprocessed).
-            val_ratio (float): Fractional size of the validation dataset, compared to the size of the original training dataset.
-            rng_seed (int): Random number generator seed.
-
-        Returns:
-            Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]: (Source train data, target train data), (Source validation data, target validation data).
-        """
-
-        # define random number generator
-        rng = np.random.default_rng(rng_seed)
-
-        # permute dataset indices
-        indices = rng.permutation(
-            X.shape[0],
+        rmse_vf, mae_vf, rmse_qth, mae_qth = compute_metrics(
+            rmse_vf_metrics, mae_vf_metrics, rmse_qth_metrics, mae_qth_metrics
         )
-        val_idx = int(val_ratio * X.shape[0])  # end index in 'indices' for validation split
 
-        # create validation split
-        X_val = X[indices[:val_idx]]
-        y_val = y[indices[:val_idx]]
-
-        # create training split
-        X_train = X[indices[val_idx:]]
-        y_train = y[indices[val_idx:]]
-
-        return (X_train, y_train), (X_val, y_val)
+        return rmse_vf, mae_vf, rmse_qth, mae_qth
